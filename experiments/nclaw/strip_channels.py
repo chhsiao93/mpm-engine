@@ -192,6 +192,30 @@ def write_positions_only_dump(src: str | Path, out: str | Path | None = None,
     return out
 
 
+def positions_only_seed_cloud(truth_path: str | Path) -> dict[str, Any]:
+    """The frame-0 rollout seed a positions-only regime would actually have.
+
+    A scene other than "dataset" never identifies theta; compare.py only seeds
+    its rollout from a positions-only dump's frame 0 (suite.cloud_from_dump
+    reads x[0], v[0], volume0, times, meta and nothing past frame 0). ``v[0]``
+    under ``fd_velocity`` is a one-sided difference of x[0] and x[1] alone, so
+    the whole-trajectory MLS derivation write_positions_only_dump runs to get
+    there is wasted for these scenes: every v/L/F/volume/mass frame past 0 it
+    computes and writes (gigabytes, for a shape scene's particle count) is
+    never read back. This reproduces exactly the same v[0] in memory, from the
+    scene's own truth dump, with no tier file written.
+    """
+    from experiments.nclaw.ingest import fd_velocity
+    from experiments.nclaw.suite import cloud_from_dump
+    cloud = cloud_from_dump(truth_path)
+    d = np.load(truth_path)
+    frame_dt = float(d["frame_dt"])
+    x01 = d["x"][:2].astype(np.float64)
+    v0 = fd_velocity(x01, frame_dt)[0]
+    cloud["v0"] = np.ascontiguousarray(v0.astype(np.float32))
+    return cloud
+
+
 def write_tier_dump(src: str | Path, tier: str, out: str | Path | None = None,
                     log=print, **kw: Any) -> Path:
     """The tier copy of one dump, built if absent and reused if present."""

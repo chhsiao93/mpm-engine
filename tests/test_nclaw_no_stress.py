@@ -158,6 +158,19 @@ def test_positions_only_records_the_derivations(positions_only):
     assert "finite differences" in notes and "least squares" in notes
 
 
+def test_positions_only_seed_cloud_matches_the_full_tier_at_frame_zero(
+        dump, positions_only):
+    """The in-memory seed a non-dataset scene uses must be exactly what the
+    full-trajectory tier dump would have given at frame 0 -- it is a cheaper
+    route to the same number, not a different derivation."""
+    seed = sc.positions_only_seed_cloud(dump)
+    full = suite.cloud_from_dump(positions_only)
+    assert np.array_equal(seed["pts"], full["pts"])
+    assert np.array_equal(seed["vol0"], full["vol0"])
+    assert np.abs(seed["v0"] - full["v0"]).max() < 1e-6 * np.abs(full["v0"]).max()
+    assert seed["n_grid"] == full["n_grid"] and seed["grid_lim"] == full["grid_lim"]
+
+
 def test_tier_path_names_and_reuse(dump, tmp_path):
     assert sc.tier_path(dump, "no_stress").name.endswith("_no_stress.npz")
     assert sc.tier_path(dump, "positions_only").name.endswith("_positions_only.npz")
