@@ -443,6 +443,20 @@ def _rotate_vec(R: np.ndarray, a: np.ndarray) -> np.ndarray:
     return np.einsum("ij,fpj->fpi", R, a)
 
 
+def _rotate_position(R: np.ndarray, x: np.ndarray, grid_lim: float) -> np.ndarray:
+    """Rotate ABSOLUTE box positions about the box centre, not the origin.
+
+    ``_rotate_vec`` is exact for free vectors (v, gravity, the throw), which
+    are translation-invariant. Positions are not: the box is [0, grid_lim]^3,
+    not centred at the origin, so R @ x alone walks particles out of the box
+    (measured: (x, -z, y) sends z in [0, 1] to y in [-1, 0], entirely outside
+    the destination grid). Rotating about the box centre keeps [0, grid_lim]^3
+    mapped to itself; ``_rotate_vec`` remains correct for every other channel.
+    """
+    c = grid_lim / 2.0
+    return _rotate_vec(R, x - c) + c
+
+
 def _rotate_tensor(R: np.ndarray, a: np.ndarray) -> np.ndarray:
     """R A R^T on a (T, P, 3, 3) field: both legs of a two-point tensor rotate."""
     return np.einsum("ij,fpjk,lk->fpil", R, a, R)
@@ -488,7 +502,7 @@ def read_nclaw_dir(nclaw_dir: str | Path, manifest: dict | str | Path | None,
     notes: list[str] = []
 
     R = np.eye(3) if man["frame_convention"] == "zup" else _rotation()
-    x = _rotate_vec(R, raw["x"].astype(np.float64))
+    x = _rotate_position(R, raw["x"].astype(np.float64), float(man["grid_lim"]))
 
     # stress alignment first: it decides the frame count everything else keeps
     lag = int(man["stress_lag_steps"]) if "stress" in raw else 0
@@ -679,12 +693,16 @@ def export_to_nclaw(dump_npz: str | Path, out_dir: str | Path,
     T = int(d["x"].shape[0]) if frames is None else min(int(frames), int(d["x"].shape[0]))
     P = int(d["x"].shape[1])
     Rt = _rotation().T                      # z-up back to y-up
+    grid_lim = float(json.loads(str(d["meta_json"]))["grid_lim"])
+    c = grid_lim / 2.0
     vol0 = d["volume0"] if "volume0" in d.files else None
     sections = [P]
     types = torch.zeros(P, dtype=torch.int)
     lag = int(stress_lag_steps)
     for f in range(T):
-        x = np.einsum("ij,pj->pi", Rt, d["x"][f].astype(np.float64))
+        # position is an affine rotation about the box centre (see
+        # _rotate_position); v is a free vector, plain linear rotation
+        x = np.einsum("ij,pj->pi", Rt, d["x"][f].astype(np.float64) - c) + c
         v = np.einsum("ij,pj->pi", Rt, d["v"][f].astype(np.float64))
         L = d["L"][f].astype(np.float64).reshape(P, 3, 3)
         F = d["F"][f].astype(np.float64).reshape(P, 3, 3)

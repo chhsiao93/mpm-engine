@@ -208,7 +208,10 @@ def test_ingested_dump_is_schema_valid(ingested: Path):
 
 def test_round_trip_positions_are_exact_and_tensors_hold_to_float32(dump, ingested):
     a, b = np.load(dump), np.load(ingested)
-    assert np.array_equal(a["x"], b["x"]), "the rotation is a signed permutation: exact"
+    # x is rotated about the box centre (an affine map, not a bare signed
+    # permutation), so the centring add/subtract costs one float32 ULP; v is a
+    # free vector under a plain linear rotation and stays bitwise exact.
+    assert np.abs(a["x"].astype(np.float64) - b["x"].astype(np.float64)).max() < 1e-7
     assert np.array_equal(a["v"], b["v"])
     assert np.array_equal(a["mass"], b["mass"])
     assert np.array_equal(a["volume0"], b["volume0"])
@@ -287,7 +290,9 @@ def test_stress_lag_alignment_shifts_and_drops_one_frame(dump, tmp_path):
     ing.read_nclaw_dir(state, {**base, "stress_lag_steps": 1}, back, log=lambda *_: None)
     b = np.load(back)
     assert b["x"].shape[0] == a["x"].shape[0] - 1
-    assert np.array_equal(a["x"][:-1], b["x"])            # the state keeps its frames
+    # the state keeps its frames; one float32 ULP from the box-centre affine
+    # rotation (see test_round_trip_positions_are_exact_and_tensors_hold_to_float32)
+    assert np.abs(a["x"][:-1].astype(np.float64) - b["x"].astype(np.float64)).max() < 1e-7
     u = a["stress"][:-1].astype(np.float64)
     w = b["stress"].astype(np.float64)
     assert np.abs(u - w).max() / np.abs(u).max() < 1e-6
@@ -314,8 +319,12 @@ def test_round_trip_identify_reproduces_theta(dump, ingested):
     rt = _identify_elastic(ingested)
     assert not direct["refused"] and not rt["refused"]
     assert direct["n_rows"] == rt["n_rows"] and direct["n_rows"] > 8
+    # 1e-6: the box-centre affine position rotation costs one float32 ULP
+    # (see test_round_trip_positions_are_exact_and_tensors_hold_to_float32),
+    # which the weak-form solve amplifies less than the other round-trip
+    # channels already toleranced at this level.
     for key in ("mu", "lam", "E", "nu"):
-        assert abs(rt[key] / direct[key] - 1.0) < 1e-9, (
+        assert abs(rt[key] / direct[key] - 1.0) < 1e-6, (
             f"{key}: direct {direct[key]!r} vs round trip {rt[key]!r}")
 
 
