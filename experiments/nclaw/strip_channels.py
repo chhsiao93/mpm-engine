@@ -110,7 +110,9 @@ def write_no_stress_dump(src: str | Path, out: str | Path | None = None,
         "meta_json": np.array(json.dumps(meta, default=float)),
     })
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out, **arrays)
+    # uncompressed is ~10 percent bigger and ~24x faster to write (see
+    # dump_writer.py); zlib dominated the write here just as it did there.
+    np.savez(out, **arrays)
     log(f"[tier] {src.name} -> {out.name}: no_stress, provenance={prov}")
     return out
 
@@ -182,7 +184,9 @@ def write_positions_only_dump(src: str | Path, out: str | Path | None = None,
         "meta_json": np.array(json.dumps(meta, default=float)),
     })
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out, **arrays)
+    # uncompressed is ~10 percent bigger and ~24x faster to write (see
+    # dump_writer.py); zlib dominated the write here just as it did there.
+    np.savez(out, **arrays)
     log(f"[tier] {src.name} -> {out.name}: positions_only, k={int(mls_k)}, "
         f"provenance={prov}")
     return out
