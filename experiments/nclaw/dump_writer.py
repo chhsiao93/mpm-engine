@@ -50,8 +50,16 @@ class DumpWriter:
         extra: dict | None = None,
         store_F: bool = False,
         compress: bool = False,
+        xonly: bool = False,
     ):
         self.compress = bool(compress)
+        # scoring (nclaw_position_mse) and rendering (blender_scene.py) only
+        # ever read "x" back from a rollout's own dump; v/L/stress/F/volume/
+        # active/mass and the mu-table/flowing-I diagnostics exist for
+        # identification input (truth/tier dumps), never for a comparison
+        # rollout's prediction. xonly skips exporting and storing all of that
+        # for a large disk and write-time saving on predictions.
+        self.xonly = bool(xonly)
         self.solver = solver
         # the elastic and elastoplastic identifications need the deformation
         # gradient and the REFERENCE particle volume, neither of which the
@@ -86,6 +94,10 @@ class DumpWriter:
         x = self.solver.export_particle_x_to_torch().cpu().numpy()
         if not np.isfinite(x).all():
             return False
+        if self.xonly:
+            self._times.append(float(t))
+            self._x.append(x.astype(np.float32))
+            return True
         v = self.solver.export_particle_v_to_torch().cpu().numpy()
         L = self.solver.export_particle_L_to_torch().cpu().numpy()      # (P, 9)
         tau = self.solver.export_particle_stress_to_torch().cpu().numpy()  # Kirchhoff (P, 9)
@@ -170,14 +182,14 @@ class DumpWriter:
 
         times = np.asarray(self._times, dtype=float)
         x = np.stack(self._x)
-        v = np.stack(self._v)
-        L = np.stack(self._L)
-        stress = np.stack(self._stress)
-        vol = np.stack(self._vol)
-        active = np.stack(self._active)
-
-        log10I, mu = self._mu_table()
-        edges, counts = self._flowing_I_hist(x, v, L, stress, vol, active)
+        if not self.xonly:
+            v = np.stack(self._v)
+            L = np.stack(self._L)
+            stress = np.stack(self._stress)
+            vol = np.stack(self._vol)
+            active = np.stack(self._active)
+            log10I, mu = self._mu_table()
+            edges, counts = self._flowing_I_hist(x, v, L, stress, vol, active)
 
         units = {
             "x": "m", "v": "m/s", "L": "1/s", "stress": "Pa",
@@ -207,23 +219,26 @@ class DumpWriter:
             gravity_inplane=self.globals["gravity_inplane"],
             pressure_source=np.array("true_mpm_trace"),
             law=np.array(self.globals["law"]),
-            mu_table_log10I=log10I,
-            mu_table_mu=mu,
-            flowing_I_hist_edges=edges,
-            flowing_I_hist_counts=counts,
             meta_json=np.array(meta_json),
             times=times,
             x=x,
-            v=v,
-            L=L,
-            stress=stress,
-            volume=vol,
-            mass=self._mass,
-            active=active,
         )
+        if not self.xonly:
+            arrays.update(
+                mu_table_log10I=log10I,
+                mu_table_mu=mu,
+                flowing_I_hist_edges=edges,
+                flowing_I_hist_counts=counts,
+                v=v,
+                L=L,
+                stress=stress,
+                volume=vol,
+                mass=self._mass,
+                active=active,
+            )
         if self.globals["theta_true"] is not None:
             arrays["theta_true"] = self.globals["theta_true"]
-        if self.store_F and self._F:
+        if self.store_F and self._F and not self.xonly:
             arrays["F"] = np.stack(self._F)
             arrays["volume0"] = self._vol0
 
