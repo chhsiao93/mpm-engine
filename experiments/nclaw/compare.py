@@ -31,8 +31,12 @@ bitwise and zeroes the stress, and the identification goes through
 experiments/nclaw/identify_no_stress.py, which states a pressure model where the
 full-channel path read the stress trace. --positions-only is the harder tier
 below it: positions and times measured, velocities by finite difference, L and F
-by moving least squares. Both tiers roll out the primary recovered parameters
-and every variant estimator the tier offers, each in its own leg.
+by moving least squares -- but only the dataset scene is ever identified from,
+so only its tier dump is materialized; every other scene's rollout is seeded
+with a frame-0 velocity derived in memory from that scene's own truth dump
+(strip_channels.positions_only_seed_cloud), never written to disk. Both tiers
+roll out the primary recovered parameters and every variant estimator the tier
+offers, each in its own leg.
 
 Run:  .venv/bin/python -m experiments.nclaw.compare sand --trajectories=/path/to/their/dumps plasticine \
           [--nclaw-bc] [--nclaw-law] [--substeps=1] [--bisect]
@@ -131,7 +135,6 @@ def main(material: str, trajectories: str | Path | None = None,
 
     dataset = DUMPS / f"{material}_dataset_truth.npz"
     variants: dict[str, dict] = {}
-    tier_dump_of: dict[str, Path] = {}
     t_ident = time.time()
     if tier is None:
         ident = stage_identify(material, dump=dataset,
@@ -140,9 +143,7 @@ def main(material: str, trajectories: str | Path | None = None,
     else:
         from experiments.nclaw.identify_no_stress import stage_identify_no_stress
         from experiments.nclaw.strip_channels import write_tier_dump
-        tier_dump_of = {s: write_tier_dump(DUMPS / f"{material}_{s}_truth.npz", tier)
-                        for s in (scenes if tier == "positions_only" else ["dataset"])}
-        identify_dump = tier_dump_of["dataset"]
+        identify_dump = write_tier_dump(dataset, tier)
         ident = stage_identify_no_stress(
             material, dump=identify_dump, tag=f"cross_{material}{tag}",
             nclaw_law=nclaw_law, nclaw_bc=nclaw_bc, substeps=substeps,
@@ -165,11 +166,19 @@ def main(material: str, trajectories: str | Path | None = None,
     rows = {}
     for scene in scenes:
         truth = DUMPS / f"{material}_{scene}_truth.npz"
-        # the rollout is seeded from the cloud the tier itself provides, so a
-        # tier whose frame-0 velocity is derived pays for that too. The no-stress
-        # tier keeps the stored velocities, so its cloud is the trajectory's own.
-        seed_from = (tier_dump_of[scene] if tier == "positions_only" else truth)
-        cloud = cloud_from_dump(seed_from)
+        # a positions-only rollout is seeded from a derived frame-0 velocity,
+        # not the measured one, so a scene other than dataset pays for that
+        # degradation too -- computed in memory from its own truth dump (see
+        # strip_channels.positions_only_seed_cloud), no tier file needed. The
+        # no-stress tier keeps the stored velocities, so its cloud is the
+        # trajectory's own regardless of scene.
+        if tier != "positions_only":
+            cloud = cloud_from_dump(truth)
+        elif scene == "dataset":
+            cloud = cloud_from_dump(identify_dump)     # the dataset tier dump itself
+        else:
+            from experiments.nclaw.strip_channels import positions_only_seed_cloud
+            cloud = positions_only_seed_cloud(truth)
         cells = {}
         for leg, theta in legs.items():
             pred = OUT / f"{material}_{scene}_{leg}{tag}.npz"
@@ -177,7 +186,7 @@ def main(material: str, trajectories: str | Path | None = None,
                 t0 = time.time()
                 run_scene(material, scene, pred, theta=dict(theta), cloud=cloud,
                           nclaw_bc=nclaw_bc, nclaw_law=nclaw_law,
-                          substeps=substeps, device=device)
+                          substeps=substeps, device=device, xonly=True)
                 print(f"[compare] {scene}/{leg} simulated in {time.time() - t0:.0f}s")
             s = nclaw_position_mse(truth, pred)
             cells[leg] = {k: s[k] for k in

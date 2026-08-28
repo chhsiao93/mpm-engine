@@ -379,8 +379,17 @@ def run_scene(material: str, shape: str, out_path: Path, theta: dict | None = No
               cfl: float = 0.35, vel: str = "preset", cloud: dict | None = None,
               nclaw_bc: bool | dict = False, nclaw_law: bool = False,
               substeps: int | None = None, device: str = "cpu",
+              xonly: bool = False,
               log=print) -> Path:
     """One truth or rollout trajectory, dumped schema-valid with F and V0.
+
+    ``xonly`` writes positions and times only, dropping v/L/stress/F/volume/
+    active/mass and the mu-table/flowing-I diagnostics. Scoring
+    (``nclaw_position_mse``) and rendering (``blender_scene.py``) only ever
+    read ``x`` back from a rollout's own dump, so a comparison prediction that
+    will never be re-seeded from can use this for a large disk and write-time
+    saving; a dump meant as truth or identification input must keep the
+    default full state.
 
     ``cloud`` (from ``cloud_from_dump``) replaces the analytic seeding with a
     provided particle cloud: frame-0 positions, reference volumes and
@@ -477,6 +486,7 @@ def run_scene(material: str, shape: str, out_path: Path, theta: dict | None = No
         law=MATERIALS[material]["law"],
         law_params=engine_params(material, theta, nclaw_law=nclaw_law),
         theta_true=None, l_convention=L_CONVENTION_STRING, store_F=True,
+        xonly=xonly,
         extra={"material": material, "shape": shape, "n_grid": n_grid,
                "grid_lim": grid_lim, "dt": dt, "substeps_per_frame": substeps,
                "gravity": list(GRAVITY),
@@ -508,9 +518,9 @@ def run_scene(material: str, shape: str, out_path: Path, theta: dict | None = No
         t_step += time.time() - t1
     t1 = time.time()
     writer.finalize(out_path, frame_dt=frame_dt)
-    log(f"[gen] wrote {out_path.name} ({time.time() - t0:.0f}s: "
-        f"substeps {t_step:.0f}s, snapshots {t_snap:.0f}s, "
-        f"file write {time.time() - t1:.0f}s)")
+    log(f"[gen] wrote {out_path.name} ({time.time() - t0:.2f}s: "
+        f"substeps {t_step:.2e}s, snapshots {t_snap:.2e}s, "
+        f"file write {time.time() - t1:.2e}s)")
     return out_path
 
 
