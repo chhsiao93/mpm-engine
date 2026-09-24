@@ -380,8 +380,16 @@ def run_scene(material: str, shape: str, out_path: Path, theta: dict | None = No
               nclaw_bc: bool | dict = False, nclaw_law: bool = False,
               substeps: int | None = None, device: str = "cpu",
               xonly: bool = False,
-              log=print) -> Path:
+              log=print, timing: dict | None = None) -> Path:
     """One truth or rollout trajectory, dumped schema-valid with F and V0.
+
+    ``timing``, if given, is updated in place with a sub-breakdown of this
+    call's wall time: ``setup_s`` (warp/simulator init, particle seeding,
+    everything before the frame loop), ``step_s`` (the physics substeps
+    alone), ``snapshot_s`` (buffering each frame's state into the writer, not
+    counting the substeps themselves), ``finalize_s`` (the single
+    ``np.savez``/``np.savez_compressed`` call at the end -- uncompressed by
+    default here, see ``DumpWriter.compress``), and ``total_s``.
 
     ``xonly`` writes positions and times only, dropping v/L/stress/F/volume/
     active/mass and the mu-table/flowing-I diagnostics. Scoring
@@ -411,6 +419,7 @@ def run_scene(material: str, shape: str, out_path: Path, theta: dict | None = No
     from the CFL. The truth-theta control needs it: their trajectory is their
     discrete solution at their dt, so the comparison must use that dt.
     """
+    t_start = time.time()
     import warp as wp
     wp.config.quiet = True
     wp.init()
@@ -500,6 +509,7 @@ def run_scene(material: str, shape: str, out_path: Path, theta: dict | None = No
                "nclaw_law": MATERIALS[material].get("nclaw_law") if nclaw_law else None,
                "recovered": theta is not None})
     t0 = time.time()
+    setup_s = t0 - t_start
     step = 0
     t_snap = t_step = 0.0
     for frame in range(n_frames + 1):
@@ -518,9 +528,14 @@ def run_scene(material: str, shape: str, out_path: Path, theta: dict | None = No
         t_step += time.time() - t1
     t1 = time.time()
     writer.finalize(out_path, frame_dt=frame_dt)
+    finalize_s = time.time() - t1
     log(f"[gen] wrote {out_path.name} ({time.time() - t0:.2f}s: "
         f"substeps {t_step:.2e}s, snapshots {t_snap:.2e}s, "
-        f"file write {time.time() - t1:.2e}s)")
+        f"file write {finalize_s:.2e}s)")
+    if timing is not None:
+        timing.update({"setup_s": setup_s, "step_s": t_step,
+                       "snapshot_s": t_snap, "finalize_s": finalize_s,
+                       "total_s": time.time() - t_start})
     return out_path
 
 
@@ -706,24 +721,30 @@ def identify_elastic(arr: dict, window_frames: int = 26, frame_stride: int = 2,
             raise ValueError("frames must be uniformly spaced; the temporal "
                              "weight assumes a constant frame spacing")
         frame_stride = int(spacing[0]) if spacing.size else 1
+    t_asm = time.time()
     sysm = assemble_elastic_timeweak(
         arr["x"], arr["F"], arr["v"], arr["vol0"], arr["mass"], arr["g"],
         arr["frame_dt"] * frame_stride, arr["n_grid"], arr["grid_lim"],
         frames=frames, window_frames=window_frames,
         collider_planes=wall_planes(arr["n_grid"], arr["grid_lim"]),
         collider_margin_cells=margin_cells, columns=columns)
+    wall_assemble_s = time.time() - t_asm
     if sysm.n_rows < 8:
         return {"refused": True, "reason": "no surviving rows",
                 "n_rows": sysm.n_rows,
-                "n_rows_before_gating": sysm.n_rows_before_gating}
+                "n_rows_before_gating": sysm.n_rows_before_gating,
+                "wall_assemble_s": wall_assemble_s, "wall_fit_s": 0.0}
+    t_fit = time.time()
     out = solve_elastic_grid(sysm)
+    wall_fit_s = time.time() - t_fit
     E, nu = moduli_to_E_nu(out["mu"], out["lam"])
-    out.update({"E": E, "nu": nu, "refused": False,
+    out.update({"E": E, "nu": nu, "refused": False, "estimator": "weak_form",
                 "n_rows_before_gating": sysm.n_rows_before_gating,
                 "row_survival": sysm.row_survival,
                 "strain_coverage": list(sysm.strain_coverage),
                 "n_frames_used": len(sysm.frames_used),
-                "window_frames": window_frames, "frame_stride": frame_stride})
+                "window_frames": window_frames, "frame_stride": frame_stride,
+                "wall_assemble_s": wall_assemble_s, "wall_fit_s": wall_fit_s})
     log(f"[ident] elastic mu={out['mu']:.4e} lam={out['lam']:.4e} "
         f"E={E:.4e} nu={nu:.4f} rows={sysm.n_rows} cond={out['cond_AtA']:.2e}")
     return out
@@ -738,11 +759,13 @@ def identify_yield(arr: dict, mu_hat: float, plateau_pct: float = 99.9,
     the mu the elastic solve already recovered. Identifiable only if particles
     reached the cap. Sub-yield loading gives a lower bound, so the fit refuses.
     """
+    t_fit = time.time()
     T = arr["F"].shape[0]
     vals = np.concatenate([_hencky_dev_norm(arr["F"][f]) for f in range(0, T, 4)])
     vals = vals[np.isfinite(vals)]
     if vals.size == 0:
-        return {"refused": True, "reason": "no finite deformation gradient"}
+        return {"refused": True, "reason": "no finite deformation gradient",
+                "wall_assemble_s": 0.0, "wall_fit_s": time.time() - t_fit}
     cap = float(np.percentile(vals, plateau_pct))
     at_cap = float((vals >= 0.98 * cap).mean())
     # The return map clips every yielded particle's strain norm to
@@ -754,7 +777,9 @@ def identify_yield(arr: dict, mu_hat: float, plateau_pct: float = 99.9,
     res = {"eps_y": cap, "plateau_fraction": at_cap,
            "plateau_concentration": concentration,
            "yield_stress": float(2.0 * mu_hat * cap),
-           "plateau_pct": plateau_pct}
+           "plateau_pct": plateau_pct, "estimator": "closed_form_strain_cap",
+           # no matrix assembly here: a closed-form statistic of the stored F
+           "wall_assemble_s": 0.0, "wall_fit_s": time.time() - t_fit}
     if at_cap < plateau_frac_min or concentration < 3.0:
         res.update({"refused": True,
                     "reason": ("strain cap not reached: "
@@ -904,18 +929,25 @@ def identify_friction(arr: dict, window_frames: int = 26, frame_stride: int = 2,
         return {"refused": True,
                 "reason": (f"only {len(frames)} contiguous shearing frames, "
                            f"fewer than the {window_frames}-frame window"),
-                "n_rows": 0, "n_rows_before_gating": 0}
+                "n_rows": 0, "n_rows_before_gating": 0,
+                "wall_assemble_s": 0.0, "wall_fit_s": 0.0}
+    t_asm = time.time()
     sysm = assemble_columns_timeweak(
         arr["x"], arr["v"], arr["mass"], arr["g"],
         arr["frame_dt"] * frame_stride, arr["n_grid"], arr["grid_lim"],
         columns_fn, n_columns=1, frames=frames, window_frames=window_frames,
         collider_planes=wall_planes(arr["n_grid"], arr["grid_lim"]),
         collider_margin_cells=margin_cells, valid_frac_min=yield_frac_min)
+    wall_assemble_s = time.time() - t_asm
     if sysm.n_rows < 8:
         return {"refused": True, "reason": "no surviving rows",
                 "n_rows": sysm.n_rows, "yield_frac_min": yield_frac_min,
-                "n_rows_before_gating": sysm.n_rows_before_gating}
+                "n_rows_before_gating": sysm.n_rows_before_gating,
+                "wall_assemble_s": wall_assemble_s, "wall_fit_s": 0.0}
+    t_fit = time.time()
     out = solve_elastic_grid(sysm)
+    wall_fit_s = time.time() - t_fit
+    out["wall_assemble_s"], out["wall_fit_s"] = wall_assemble_s, wall_fit_s
     mu_c = out["theta"][0]
     # When the solve's relative residual exceeds solve_residual_bar and a cone
     # level exists, the cone level is the estimate. Both numbers are recorded.
@@ -937,6 +969,7 @@ def identify_friction(arr: dict, window_frames: int = 26, frame_stride: int = 2,
                                           else mu_to_friction(mu_plateau)),
                 "yield_band": float(yield_band),
                 "mu_c": mu_c, "friction_angle": mu_to_friction(mu_c),
+                "estimator": "weak_form" if used == "solve" else "cone_level_reading",
                 "refused": False, "row_survival": sysm.row_survival,
                 "n_rows_before_gating": sysm.n_rows_before_gating,
                 "yield_frac_min": yield_frac_min, "gd_min": gd_min,
@@ -999,21 +1032,27 @@ def identify_eos(arr: dict, gamma: float = 1.1, window_frames: int = 26,
         return Vsig, None, ok, np.abs(J - 1.0)
 
     frames = list(range(0, arr["x"].shape[0], frame_stride))
+    t_asm = time.time()
     sysm = assemble_columns_timeweak(
         arr["x"], arr["v"], arr["mass"], arr["g"],
         arr["frame_dt"] * frame_stride, arr["n_grid"], arr["grid_lim"],
         columns_fn, n_columns=1, frames=frames, window_frames=window_frames,
         collider_planes=wall_planes(arr["n_grid"], arr["grid_lim"]),
         collider_margin_cells=margin_cells)
+    wall_assemble_s = time.time() - t_asm
     if sysm.n_rows < 8:
         return {"refused": True, "reason": "no surviving rows",
                 "n_rows": sysm.n_rows,
-                "n_rows_before_gating": sysm.n_rows_before_gating}
+                "n_rows_before_gating": sysm.n_rows_before_gating,
+                "wall_assemble_s": wall_assemble_s, "wall_fit_s": 0.0}
+    t_fit = time.time()
     out = solve_elastic_grid(sysm)
+    out["wall_assemble_s"], out["wall_fit_s"] = wall_assemble_s, time.time() - t_fit
     stiffness = out["theta"][0]
     Jc = np.concatenate(Jall) if Jall else np.ones(1)
     key = "lam" if form == "linear" else "bulk_modulus"
     out.update({key: stiffness, "form": form, "gamma": gamma, "refused": False,
+                "estimator": "weak_form",
                 "row_survival": sysm.row_survival,
                 "n_rows_before_gating": sysm.n_rows_before_gating,
                 "volumetric_strain_p99": float(np.percentile(np.abs(Jc - 1.0), 99))})
@@ -1036,42 +1075,61 @@ def lam_to_E(lam: float, nu: float) -> float:
     return float(lam * (1.0 + nu) * (1.0 - 2.0 * nu) / nu)
 
 
-def theta_for_engine(material: str, ident: dict,
-                     nclaw_law: bool = False) -> tuple[dict, list[str]]:
+def theta_for_engine(material: str, ident: dict, nclaw_law: bool = False,
+                     ) -> tuple[dict, list[str], dict[str, str]]:
     """Recovered parameters in the engine's own arguments, plus what was refused.
 
     A refused parameter falls back to its known-class prior value, which is the
     truth entry here, and the returned list names the fallback for the report.
+
+    The third return value labels, per parameter key, how it was produced:
+    ``"assumed"`` (never attempted, or attempted and refused -- either way the
+    value is the truth prior, not an estimate), ``"weak_form"`` (the convex
+    momentum-balance solve), or whatever the estimator names itself
+    (``"closed_form_strain_cap"`` for plasticine's yield plateau read,
+    ``"rollout_scan"`` for the derivative-free scan, ``"replay_yield"`` /
+    ``"replay_friction"`` for the positions-only replay attempt -- the last
+    two are only reachable if a caller substitutes a variant's theta for the
+    primary one; the primary path here only ever assigns "assumed" or
+    "weak_form"/"closed_form_strain_cap"/"rollout_scan").
     """
     from ident.weakform.elastic_grid import moduli_to_E_nu
     truth = MATERIALS[material]["truth"]
     theta: dict = {}
     refused: list[str] = []
+    estimator: dict[str, str] = {}
     if material in ("jelly", "plasticine"):
         el = ident.get("elastic", {})
         if el.get("refused", True):
             refused += ["E", "nu"]
             theta.update({"E": truth["E"], "nu": truth["nu"]})
+            estimator["E"] = estimator["nu"] = "assumed"
         else:
             E, nu = moduli_to_E_nu(el["mu"], el["lam"])
             theta.update({"E": E, "nu": nu})
+            estimator["E"] = estimator["nu"] = el.get("estimator", "weak_form")
         if material == "plasticine":
             y = ident.get("yield", {})
             if y.get("refused", True):
                 refused.append("yield_stress")
                 theta["yield_stress"] = truth["yield_stress"]
+                estimator["yield_stress"] = "assumed"
             else:
                 theta["yield_stress"] = y["yield_stress"]
+                estimator["yield_stress"] = y.get("estimator", "closed_form_strain_cap")
     elif material == "sand":
         fr = ident.get("friction", {})
         if fr.get("refused", True):
             refused.append("friction_angle")
             theta["friction_angle"] = truth["friction_angle"]
+            estimator["friction_angle"] = "assumed"
         else:
             theta["friction_angle"] = fr["friction_angle"]
+            estimator["friction_angle"] = fr.get("estimator", "weak_form")
         # the elastic pair below yield is not excited by this throw; prior-fixed
         refused += ["E", "nu"]
         theta.update({"E": truth["E"], "nu": truth["nu"]})
+        estimator["E"] = estimator["nu"] = "assumed"
     elif material == "water":
         eos = ident.get("eos", {})
         if nclaw_law:
@@ -1081,16 +1139,22 @@ def theta_for_engine(material: str, ident: dict,
             if eos.get("refused", True):
                 refused.append("lam")
                 theta.update({"E": truth["E"], "nu": nu})
+                estimator["E"] = "assumed"
             else:
                 theta.update({"E": lam_to_E(eos["lam"], nu), "nu": nu})
+                estimator["E"] = eos.get("estimator", "weak_form")
         else:
             if eos.get("refused", True):
                 refused.append("bulk_modulus")
                 theta["bulk_modulus"] = bulk_from_E_nu(truth["E"], truth["nu"])
+                estimator["bulk_modulus"] = "assumed"
             else:
                 theta["bulk_modulus"] = eos["bulk_modulus"]
+                estimator["bulk_modulus"] = eos.get("estimator", "weak_form")
             theta.update({"E": truth["E"], "nu": truth["nu"]})
-    return theta, refused
+            estimator.setdefault("E", "assumed")
+        estimator["nu"] = "assumed"
+    return theta, refused, estimator
 
 
 # Time-weak window length, in sampled frames, per material. Longer is better
@@ -1116,6 +1180,7 @@ def stage_identify(material: str, n_grid: int = N_GRID,
     cube = Path(dump) if dump is not None else dump_path(material, "cube", "truth")
     if not cube.exists():
         raise SystemExit(f"missing {cube}; run the gen stage first")
+    t0 = time.time()
     arr = _load_arrays(cube)
     ident: dict = {"source_dump": cube.name, "n_grid": arr["n_grid"]}
     if material in ("jelly", "plasticine"):
@@ -1131,15 +1196,30 @@ def stage_identify(material: str, n_grid: int = N_GRID,
         ident["eos"] = identify_eos(
             arr, window_frames=window_frames,
             form="linear" if nclaw_law else "power_law", log=log)
-    theta, refused = theta_for_engine(material, ident, nclaw_law=nclaw_law)
+    identify_total_s = time.time() - t0
+    # Full tier: every channel (x, v, F, stress) is measured directly, so
+    # there is no field reconstruction step; the assemble/fit split comes
+    # straight from whichever identify_* function(s) ran above.
+    sub_dicts = [d for d in (ident.get("elastic"), ident.get("yield"),
+                             ident.get("friction"), ident.get("eos")) if d]
+    ident["timing_breakdown_s"] = {
+        "reconstruct_fields_s": 0.0,
+        "assemble_equations_s": sum(d.get("wall_assemble_s", 0.0) for d in sub_dicts),
+        "fit_parameters_s": sum(d.get("wall_fit_s", 0.0) for d in sub_dicts),
+        "simulate_s": 0.0,
+        "identify_total_s": identify_total_s,
+    }
+    theta, refused, param_estimator = theta_for_engine(
+        material, ident, nclaw_law=nclaw_law)
     ident["theta_engine"] = theta
     ident["refused_parameters"] = refused
+    ident["parameter_estimator"] = param_estimator
     ident["truth"] = MATERIALS[material]["truth"]
     ident["nclaw_law"] = MATERIALS[material].get("nclaw_law") if nclaw_law else None
     OUT.mkdir(parents=True, exist_ok=True)
     name = f"identify_{material}.json" if tag is None else f"identify_{material}_{tag}.json"
     (OUT / name).write_text(json.dumps(ident, indent=2, default=float))
-    log(f"[ident] theta={theta} refused={refused}")
+    log(f"[ident] theta={theta} refused={refused} ({identify_total_s:.2f}s)")
     return ident
 
 

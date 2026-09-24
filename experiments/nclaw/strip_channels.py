@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -119,13 +120,18 @@ def write_no_stress_dump(src: str | Path, out: str | Path | None = None,
 
 def write_positions_only_dump(src: str | Path, out: str | Path | None = None,
                               mls_k: int = 24, mls_ridge: float = 1.0e-8,
-                              log=print) -> Path:
+                              log=print, timing: dict | None = None) -> Path:
     """Copy a dump keeping positions, times and the scene facts, deriving the rest.
 
     The derivations are ``ingest.fd_velocity``, ``ingest.mls_velocity_gradient``
     and ``ingest.mls_deformation_gradient``, the same functions a folder of
     theirs missing those channels goes through, over neighbour sets fixed in the
     reference frame.
+
+    ``timing``, if given, is updated with a sub-breakdown: ``fd_velocity_s``,
+    ``neighbor_search_s``, ``mls_solve_s`` (both the L and F fits),
+    ``volume_mass_s``, and ``npz_write_s`` (the final ``np.savez`` call --
+    uncompressed; see the note at the bottom of this function).
     """
     src = Path(src)
     validate_dump_schema(src)
@@ -137,16 +143,25 @@ def write_positions_only_dump(src: str | Path, out: str | Path | None = None,
     frame_dt = float(d["frame_dt"])
     rho = float(d["rho_s"])
 
-    nbr = _neighbors(x[0], int(mls_k))
+    sub_timing: dict = {}
+    t1 = time.time()
     v = fd_velocity(x, frame_dt)
+    sub_timing["fd_velocity_s"] = time.time() - t1
+    t1 = time.time()
+    nbr = _neighbors(x[0], int(mls_k))
+    sub_timing["neighbor_search_s"] = time.time() - t1
+    t1 = time.time()
     L = mls_velocity_gradient(x, v, nbr, float(mls_ridge))
     F = mls_deformation_gradient(x, nbr, float(mls_ridge))
+    sub_timing["mls_solve_s"] = time.time() - t1
     J = np.linalg.det(F)
     J = np.where(np.abs(J) < 1e-12, 1.0, J)
 
+    t1 = time.time()
     vol0 = d["volume0"].astype(np.float64)         # scene fact: their seeding volume
     volume = J * vol0[None, :]
     mass = (rho * vol0).astype(np.float32)
+    sub_timing["volume_mass_s"] = time.time() - t1
 
     prov = {"x": "measured", "v": "derived", "L": "derived", "F": "derived",
             "volume": "derived", "mass": "derived", "volume0": "scene_fact",
@@ -186,9 +201,14 @@ def write_positions_only_dump(src: str | Path, out: str | Path | None = None,
     out.parent.mkdir(parents=True, exist_ok=True)
     # uncompressed is ~10 percent bigger and ~24x faster to write (see
     # dump_writer.py); zlib dominated the write here just as it did there.
+    # NOT np.savez_compressed -- same choice as DumpWriter.compress=False.
+    t1 = time.time()
     np.savez(out, **arrays)
+    sub_timing["npz_write_s"] = time.time() - t1
     log(f"[tier] {src.name} -> {out.name}: positions_only, k={int(mls_k)}, "
         f"provenance={prov}")
+    if timing is not None:
+        timing.update(sub_timing)
     return out
 
 
@@ -217,8 +237,18 @@ def positions_only_seed_cloud(truth_path: str | Path) -> dict[str, Any]:
 
 
 def write_tier_dump(src: str | Path, tier: str, out: str | Path | None = None,
-                    log=print, **kw: Any) -> Path:
-    """The tier copy of one dump, built if absent and reused if present."""
+                    log=print, timing: dict | None = None, **kw: Any) -> Path:
+    """The tier copy of one dump, built if absent and reused if present.
+
+    NOTE for timing: the "if absent" cache is here, not inside
+    ``write_positions_only_dump``/``write_no_stress_dump`` (those two always
+    unconditionally recompute and overwrite once called). A stale tier dump
+    left over from a previous run makes this a no-op and ``timing`` comes
+    back unset -- delete the tier dump under its source's directory (that is,
+    ``<src>_no_stress.npz`` / ``<src>_positions_only.npz``, e.g. under
+    out/nclaw_cross_generalize/dumps/) before a run you want field
+    reconstruction actually timed for, exactly like the rollout .npz caches.
+    """
     dest = Path(out) if out is not None else tier_path(src, tier)
     if dest.exists():
         log(f"[tier] reuse {dest.name} (exists)")
@@ -226,7 +256,7 @@ def write_tier_dump(src: str | Path, tier: str, out: str | Path | None = None,
     if tier == "no_stress":
         return write_no_stress_dump(src, dest, log=log, **kw)
     if tier == "positions_only":
-        return write_positions_only_dump(src, dest, log=log, **kw)
+        return write_positions_only_dump(src, dest, log=log, timing=timing, **kw)
     raise ValueError(f"unknown tier {tier!r}; known: {TIERS}")
 
 

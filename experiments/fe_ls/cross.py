@@ -65,6 +65,13 @@ PUBLISHED = {"jelly": {"dataset": 2.4e-4, "time": 9.8e-4, "vel_0001": 2.4e-4,
                       "vel_0007": 6.5e-5, "vel_0008": 6.5e-5},
              "water": {"dataset": 2.0e-5, "time": 3.5e-4, "vel_0001": 1.9e-5,
                        "vel_0007": 1.9e-5, "vel_0008": 1.9e-5}}
+# the fifth scene, the held-out mesh (_rollout_legs names it "shape_<mesh>",
+# suite.py's own comment on NCLAW_SHAPE_CLIP_BOUND explains why the clip
+# bound -- not this table -- is what varies per scene): NCLaw's geometry
+# column, suite.NCLAW_PUBLISHED[material]["generalization"], keyed to match.
+for _mat, _shape in suite.NCLAW_HELD_OUT_SHAPE.items():
+    PUBLISHED[_mat][f"shape_{_shape}"] = suite.NCLAW_PUBLISHED[_mat]["generalization"]
+del _mat, _shape
 
 
 def identify_friction_fe_binned(arr: dict, fe, gd_min: float = 1.0,
@@ -256,7 +263,7 @@ def _load(material: str) -> dict:
 
 
 def _rollout_legs(material: str, legs: list[tuple[str, str, dict]],
-                  log=print) -> dict:
+                  device: str = "cpu", log=print) -> dict:
     """Every accepted leg on every scene, seeded from their frame-0 clouds."""
     flags = FLAGS[material]
     scenes = sorted(p.name.split(f"{material}_", 1)[1].rsplit("_truth.npz", 1)[0]
@@ -269,36 +276,50 @@ def _rollout_legs(material: str, legs: list[tuple[str, str, dict]],
         cells: dict = {}
         for leg, mat_key, theta in legs:
             pred = OUT / f"{material}_{scene}_{leg}.npz"
+            sim_wall_s = None
+            sim_timing: dict = {}
             if not pred.exists():
                 t0 = time.time()
+                # xonly: these prediction dumps are scored (nclaw_position_mse
+                # reads x only) and never re-seeded from, so the writer can
+                # skip v/L/stress/F/volume/active/mass -- same choice
+                # experiments.nclaw.compare makes for its own prediction dumps.
                 suite.run_scene(mat_key, scene, pred, theta=dict(theta),
                                 cloud=cloud,
                                 nclaw_bc=flags.get("nclaw_bc", False),
                                 nclaw_law=flags.get("nclaw_law", False),
-                                substeps=flags.get("substeps"), log=log)
-                log(f"[fe-cross] {scene}/{leg} simulated in {time.time()-t0:.0f}s")
+                                substeps=flags.get("substeps"), device=device,
+                                log=log, xonly=True, timing=sim_timing)
+                sim_wall_s = time.time() - t0
+                log(f"[fe-cross] {scene}/{leg} simulated in {sim_wall_s:.0f}s")
             s = suite.nclaw_position_mse(truth, pred, strict=False)
             cell = {k: s[k] for k in ("mse", "mse_final_frame", "rmse_mm", "n_frames")}
             cell["diverged"] = bool(s["n_frames"] < n_expected)
+            cell["sim_wall_s"] = sim_wall_s          # None => reused a cached rollout
+            cell["sim_timing"] = sim_timing or None  # setup/step/snapshot/finalize
             if cell["diverged"]:
                 cell["reason"] = (f"non-finite at frame {s['n_frames']} of "
                                   f"{n_expected}; partial score not comparable")
-            cell["published"] = PUBLISHED[material][scene]
-            if not cell["diverged"]:
-                cell["margin_vs_published"] = PUBLISHED[material][scene] / s["mse"]
+            published = PUBLISHED[material].get(scene)  # None => not tabulated above
+            cell["published"] = published
+            if cell["diverged"]:
+                label = "diverged"
+            elif published is not None:
+                cell["margin_vs_published"] = published / s["mse"]
                 label = f"{cell['margin_vs_published']:.1f}x vs published"
             else:
-                label = "diverged"
+                label = "no published number for this scene"
             log(f"[fe-cross] {scene}/{leg}: MSE {s['mse']:.3e} ({label})")
             cells[leg] = cell
         rows[scene] = cells
     return rows
 
 
-def run_material(material: str, log=print) -> dict:
+def run_material(material: str, device: str = "cpu", log=print) -> dict:
+    t_material = time.time()
     arr = _load(material)
     res: dict = {"material": material, "source": f"{material}_dataset_truth.npz",
-                 "tier": "full_channels", "flags": FLAGS[material],
+                 "tier": "full_channels", "flags": FLAGS[material], "device": device,
                  "identify": {}, "legs_rolled": [], "scenes": {}}
     legs: list[tuple[str, str, dict]] = []
 
@@ -446,21 +467,51 @@ def run_material(material: str, log=print) -> dict:
                        "missing yield")
 
     res["legs_rolled"] = [leg for leg, _, _ in legs]
+    t_rollout = time.time()
     if legs:
-        res["scenes"] = _rollout_legs(material, legs, log=log)
+        res["scenes"] = _rollout_legs(material, legs, device=device, log=log)
+    wall_rollout_s = time.time() - t_rollout
+
+    # identify_total_s: every identify_*_fe wall_seconds this material ran,
+    # sand's binned-cone and yield-surface legs included.
+    identify_total_s = sum(v.get("wall_seconds", 0.0) or 0.0
+                           for v in res["identify"].values() if isinstance(v, dict))
+    eval_sim_timings = [cell["sim_timing"] for cells in res["scenes"].values()
+                       for cell in cells.values() if cell.get("sim_timing")]
+    wall_simulate_eval_s = sum(t.get("total_s", 0.0) for t in eval_sim_timings)
+    simulate_eval_detail_s = {
+        k: sum(t.get(k, 0.0) for t in eval_sim_timings)
+        for k in ("setup_s", "step_s", "snapshot_s", "finalize_s")}
+    res["timing_breakdown_s"] = {
+        "identify_total_s": identify_total_s,
+        "rollout_wall_s": wall_rollout_s,          # includes cache checks/scoring
+        "simulate_eval_s": wall_simulate_eval_s,   # sum of fresh rollouts only
+        "simulate_eval_detail_s": simulate_eval_detail_s,
+        "material_total_s": time.time() - t_material,
+    }
+    log(f"[fe-cross] {material} timing: identify {identify_total_s:.1f}s, "
+        f"simulate {wall_simulate_eval_s:.1f}s {simulate_eval_detail_s}, "
+        f"total {res['timing_breakdown_s']['material_total_s']:.1f}s")
     return res
 
 
 def main(argv: list[str] | None = None) -> None:
-    mats = (argv if argv is not None else sys.argv[1:]) or \
+    raw = argv if argv is not None else sys.argv[1:]
+    device = next((a.split("=", 1)[1] for a in raw if a.startswith("--device=")),
+                  "cpu")
+    mats = [a for a in raw if not a.startswith("--device=")] or \
         ["sand", "jelly", "water", "plasticine"]
     OUT.mkdir(parents=True, exist_ok=True)
     path = OUT / "results.json"
     results = json.loads(path.read_text()) if path.exists() else {}
+    print(f"[fe-cross] device={device}")
+    t0 = time.time()
     for m in mats:
-        results[m] = run_material(m)
+        results[m] = run_material(m, device=device)
         path.write_text(json.dumps(results, indent=2, default=float))
-        print(f"[fe-cross] {m} recorded -> {path}")
+        print(f"[fe-cross] {m} recorded -> {path} "
+              f"({results[m]['timing_breakdown_s']['material_total_s']:.1f}s)")
+    print(f"[fe-cross] {len(mats)} material(s) in {time.time() - t0:.1f}s total")
 
 
 if __name__ == "__main__":

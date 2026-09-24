@@ -36,6 +36,8 @@ observably).
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 SIG_FLOOR = 0.05                     # their clamp_min on singular values
@@ -268,18 +270,24 @@ def _fit_scale_on_flow_set(arr: dict, Fe: np.ndarray, flow: np.ndarray,
     if len(frames) < window_frames:
         return {"refused": True, "n_rows": 0, "n_rows_before_gating": 0,
                 "reason": (f"only {len(frames)} contiguous frames with 50 flowing "
-                           f"particles, fewer than the {window_frames}-frame window")}
+                           f"particles, fewer than the {window_frames}-frame window"),
+                "wall_assemble_s": 0.0, "wall_fit_s": 0.0}
+    t_asm = time.time()
     sysm = assemble_columns_timeweak(
         arr["x"], arr["v"], arr["mass"], arr["g"],
         arr["frame_dt"] * frame_stride, arr["n_grid"], arr["grid_lim"],
         columns_fn, n_columns=1, frames=frames, window_frames=window_frames,
         collider_planes=wall_planes(arr["n_grid"], arr["grid_lim"]),
         collider_margin_cells=margin_cells, valid_frac_min=valid_frac_min)
+    wall_assemble_s = time.time() - t_asm
     if sysm.n_rows < 8:
         return {"refused": True, "reason": "no surviving rows",
                 "n_rows": sysm.n_rows,
-                "n_rows_before_gating": sysm.n_rows_before_gating}
+                "n_rows_before_gating": sysm.n_rows_before_gating,
+                "wall_assemble_s": wall_assemble_s, "wall_fit_s": 0.0}
+    t_fit = time.time()
     out = solve_elastic_grid(sysm)
+    out["wall_assemble_s"], out["wall_fit_s"] = wall_assemble_s, time.time() - t_fit
     out.update({"refused": False, "n_flowing_frames": len(frames),
                 "row_survival": sysm.row_survival,
                 "n_rows_before_gating": sysm.n_rows_before_gating})
@@ -305,18 +313,30 @@ def identify_yield_replay(arr: dict, mu_hat: float, lam_hat: float,
     """
     E = float(mu_hat * (3.0 * lam_hat + 2.0 * mu_hat) / (lam_hat + mu_hat))
     nu = float(lam_hat / (2.0 * (lam_hat + mu_hat)))
+    t_recon = time.time()
     Fincr = incremental_gradients(arr["x"], k=mls_k)
+    wall_reconstruct_s = time.time() - t_recon
+    wall_assemble_s = wall_fit_s = 0.0
     y, path = float(y0), []
     out: dict = {}
+
+    def _timed(d: dict) -> dict:
+        return {**d, "wall_reconstruct_s": wall_reconstruct_s,
+                "wall_assemble_s": wall_assemble_s, "wall_fit_s": wall_fit_s}
+
     for it in range(max_iter):
+        t_recon2 = time.time()
         Fe, flow = replay_elastic(
             Fincr, lambda F: project_von_mises(F, E, nu, y))
+        wall_reconstruct_s += time.time() - t_recon2
         ones = np.ones(arr["x"].shape[:2])
         out = _fit_scale_on_flow_set(
             arr, Fe, flow, E, nu, ones, window_frames, frame_stride,
             margin_cells, valid_frac_min, log=log)
+        wall_assemble_s += out.get("wall_assemble_s", 0.0)
+        wall_fit_s += out.get("wall_fit_s", 0.0)
         if out.get("refused"):
-            out.update({"estimator": "replay_yield", "iterations": path})
+            out.update(_timed({"estimator": "replay_yield", "iterations": path}))
             return out
         y_new = float(out["theta"][0])
         path.append({"candidate": y, "fit": y_new,
@@ -324,18 +344,18 @@ def identify_yield_replay(arr: dict, mu_hat: float, lam_hat: float,
         log(f"[replay] yield iter {it}: candidate {y:.4e} -> fit {y_new:.4e} "
             f"resid {float(out['residual_rel']):.3f}")
         if not np.isfinite(y_new) or y_new <= 0.0:
-            out.update({"refused": True, "estimator": "replay_yield",
+            out.update(_timed({"refused": True, "estimator": "replay_yield",
                         "iterations": path,
-                        "reason": f"non-physical yield fit {y_new!r}"})
+                        "reason": f"non-physical yield fit {y_new!r}"}))
             return out
         done = abs(y_new - y) <= rel_tol * y
         y = y_new
         if done:
             break
-    out.update({"yield_stress": y, "estimator": "replay_yield",
+    out.update(_timed({"yield_stress": y, "estimator": "replay_yield",
                 "iterations": path, "mls_k": mls_k,
                 "residual_bar": residual_bar,
-                "elastic_pair_used": {"E": E, "nu": nu}})
+                "elastic_pair_used": {"E": E, "nu": nu}}))
     if float(out["residual_rel"]) > residual_bar:
         out.update({"refused": True,
                     "reason": (f"self-consistent fit y={y:.4e} at relative "
@@ -362,9 +382,16 @@ def identify_friction_replay(arr: dict, E: float, nu: float,
     """
     import math
     mu, lam = _mu_lam(E, nu)
+    t_recon = time.time()
     Fincr = incremental_gradients(arr["x"], k=mls_k)
+    wall_reconstruct_s = time.time() - t_recon
+    wall_assemble_s = wall_fit_s = 0.0
     phi, path = float(phi0), []
     out: dict = {}
+
+    def _timed(d: dict) -> dict:
+        return {**d, "wall_reconstruct_s": wall_reconstruct_s,
+                "wall_assemble_s": wall_assemble_s, "wall_fit_s": wall_fit_s}
 
     def alpha_of(p: float) -> float:
         s = math.sin(math.radians(p))
@@ -375,22 +402,26 @@ def identify_friction_replay(arr: dict, E: float, nu: float,
         return math.degrees(math.asin(min(max(s, 0.0), 0.999)))
 
     for it in range(max_iter):
+        t_recon2 = time.time()
         Fe, on_cone = replay_elastic(
             Fincr, lambda F: project_drucker_prager(F, E, nu, phi))
+        wall_reconstruct_s += time.time() - t_recon2
         tr = np.log(np.clip(np.linalg.svd(Fe, compute_uv=False),
                             SIG_FLOOR, None)).sum(-1)
         column_norm = -(3.0 * lam + 2.0 * mu) * tr
         out = _fit_scale_on_flow_set(
             arr, Fe, on_cone, E, nu, column_norm, window_frames, frame_stride,
             margin_cells, valid_frac_min, log=log)
+        wall_assemble_s += out.get("wall_assemble_s", 0.0)
+        wall_fit_s += out.get("wall_fit_s", 0.0)
         if out.get("refused"):
-            out.update({"estimator": "replay_friction", "iterations": path})
+            out.update(_timed({"estimator": "replay_friction", "iterations": path}))
             return out
         a_new = float(out["theta"][0])
         if not np.isfinite(a_new) or a_new <= 0.0:
-            out.update({"refused": True, "estimator": "replay_friction",
+            out.update(_timed({"refused": True, "estimator": "replay_friction",
                         "iterations": path,
-                        "reason": f"non-physical cone coefficient {a_new!r}"})
+                        "reason": f"non-physical cone coefficient {a_new!r}"}))
             return out
         phi_new = phi_of(a_new)
         path.append({"candidate_deg": phi, "fit_deg": phi_new,
@@ -402,10 +433,10 @@ def identify_friction_replay(arr: dict, E: float, nu: float,
         phi = phi_new
         if done:
             break
-    out.update({"friction_angle": phi, "alpha": alpha_of(phi),
+    out.update(_timed({"friction_angle": phi, "alpha": alpha_of(phi),
                 "estimator": "replay_friction", "iterations": path,
                 "mls_k": mls_k, "residual_bar": residual_bar,
-                "elastic_pair_assumed": {"E": E, "nu": nu}})
+                "elastic_pair_assumed": {"E": E, "nu": nu}}))
     if float(out["residual_rel"]) > residual_bar:
         out.update({"refused": True,
                     "reason": (f"self-consistent fit phi={phi:.2f} deg at relative "

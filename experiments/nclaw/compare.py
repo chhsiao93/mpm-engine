@@ -135,6 +135,8 @@ def main(material: str, trajectories: str | Path | None = None,
 
     dataset = DUMPS / f"{material}_dataset_truth.npz"
     variants: dict[str, dict] = {}
+    wall_reconstruct_tier_s = 0.0
+    tier_dump_timing: dict = {}
     t_ident = time.time()
     if tier is None:
         ident = stage_identify(material, dump=dataset,
@@ -143,10 +145,13 @@ def main(material: str, trajectories: str | Path | None = None,
     else:
         from experiments.nclaw.identify_no_stress import stage_identify_no_stress
         from experiments.nclaw.strip_channels import write_tier_dump
-        identify_dump = write_tier_dump(dataset, tier)
+        t_tier = time.time()
+        identify_dump = write_tier_dump(dataset, tier, timing=tier_dump_timing)
+        wall_reconstruct_tier_s = time.time() - t_tier
         ident = stage_identify_no_stress(
             material, dump=identify_dump, tag=f"cross_{material}{tag}",
             nclaw_law=nclaw_law, nclaw_bc=nclaw_bc, substeps=substeps,
+            device=device,
             # read for the basal-plate variant only, and only inside one cell
             # of the comparison; every other use of this file at this tier is
             # diagnosis.
@@ -182,15 +187,21 @@ def main(material: str, trajectories: str | Path | None = None,
         cells = {}
         for leg, theta in legs.items():
             pred = OUT / f"{material}_{scene}_{leg}{tag}.npz"
+            sim_wall_s = None
+            sim_timing: dict = {}
             if not pred.exists():
                 t0 = time.time()
                 run_scene(material, scene, pred, theta=dict(theta), cloud=cloud,
                           nclaw_bc=nclaw_bc, nclaw_law=nclaw_law,
-                          substeps=substeps, device=device, xonly=True)
-                print(f"[compare] {scene}/{leg} simulated in {time.time() - t0:.0f}s")
+                          substeps=substeps, device=device, xonly=True,
+                          timing=sim_timing)
+                sim_wall_s = time.time() - t0
+                print(f"[compare] {scene}/{leg} simulated in {sim_wall_s:.0f}s")
             s = nclaw_position_mse(truth, pred)
             cells[leg] = {k: s[k] for k in
                           ("mse", "mse_final_frame", "rmse_mm", "n_frames")}
+            cells[leg]["sim_wall_s"] = sim_wall_s   # None => reused a cached rollout
+            cells[leg]["sim_timing"] = sim_timing or None  # setup/step/snapshot/finalize
             print(f"[compare] {scene}/{leg}: MSE {s['mse']:.3e} "
                   f"(RMS {s['rmse_mm']:.2f} mm, {s['n_frames']} frames)")
         floor = cells["truth_theta"]["mse"]
@@ -200,18 +211,58 @@ def main(material: str, trajectories: str | Path | None = None,
         cells["identification_excess"] = cells["identification_excess_recovered"]
         rows[scene] = cells
 
+    eval_sim_timings = [cell["sim_timing"] for cells in rows.values()
+                       for leg, cell in cells.items()
+                       if isinstance(cell, dict) and cell.get("sim_timing")]
+    wall_simulate_eval_s = sum(t.get("total_s", 0.0) for t in eval_sim_timings)
+    simulate_eval_detail_s = {
+        k: sum(t.get(k, 0.0) for t in eval_sim_timings)
+        for k in ("setup_s", "step_s", "snapshot_s", "finalize_s")}
+    ident_timing = dict(ident.get("timing_breakdown_s") or {})
+    timing_breakdown_s = {
+        "reconstruct_fields_s": wall_reconstruct_tier_s + ident_timing.get("reconstruct_fields_s", 0.0),
+        # tier-dump build (fd_velocity, one frame-0 neighbour search reused
+        # for both the L and F moving-least-squares fits -- the
+        # pre-re-neighbour baseline, restored 2026-09-05 -- and npz write);
+        # None if a stale tier dump on disk let write_tier_dump skip the
+        # rebuild -- delete
+        # <material>_dataset_truth_<tier>.npz under
+        # out/nclaw_cross_generalize/dumps/ first if you need this populated.
+        "reconstruct_tier_dump_detail_s": tier_dump_timing or None,
+        # positions-only sand/plasticine only: the SEPARATE incremental-MLS
+        # reconstruction inside the (refused) weak-form replay estimator --
+        # not the same reconstruction as the tier dump above.
+        "reconstruct_replay_s": ident_timing.get("reconstruct_fields_s", 0.0),
+        "assemble_equations_s": ident_timing.get("assemble_equations_s", 0.0),
+        "fit_parameters_s": ident_timing.get("fit_parameters_s", 0.0),
+        "simulate_search_s": ident_timing.get("simulate_s", 0.0),
+        "simulate_search_detail_s": ident_timing.get("simulate_search_detail_s"),
+        # scan_parameter() now takes this comparison's --device (previously
+        # always ran on CPU regardless of --device; fixed 2026-09-05).
+        "simulate_search_device": ident_timing.get("simulate_search_device"),
+        "simulate_eval_s": wall_simulate_eval_s,
+        "simulate_eval_device": device,
+        # eval rollouts split into physics-step / state-snapshot / npz-write
+        # (np.savez, uncompressed -- DumpWriter.compress defaults False and
+        # nothing in this pipeline overrides it) and warp/simulator setup.
+        "simulate_eval_detail_s": simulate_eval_detail_s,
+        "identify_total_s": wall_identify,
+    }
+
     res = {"material": material, "nclaw_bc": nclaw_bc, "nclaw_law": nclaw_law,
            "substeps": substeps, "tier": tier or "full_channels",
            "identified_from": identify_dump.name,
            "channel_provenance": ident.get("channel_provenance"),
            "wall_identify_s": wall_identify,
            "wall_times_s": ident.get("wall_times_s"),
+           "timing_breakdown_s": timing_breakdown_s,
+           "device": device,
            "theta_recovered": theta_rec,
            "theta_truth": theta_true,
            "theta_variants": {k: {kk: v[kk] for kk in v if kk != "theta"}
                               | {"theta": v["theta"]} for k, v in variants.items()},
            "identify_diagnostics": {k: ident.get(k) for k in
-                                    ("refused_parameters",)},
+                                    ("refused_parameters", "parameter_estimator")},
            "scenes": rows}
     path = OUT / f"compare_{material}{tag}.json"
     path.write_text(json.dumps(res, indent=2, default=float))

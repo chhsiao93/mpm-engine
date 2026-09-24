@@ -268,18 +268,24 @@ def identify_yield_momentum(arr: dict, mu_hat: float, lam_hat: float,
     if len(frames) < window_frames:
         return {"refused": True, "n_rows": 0, "n_rows_before_gating": 0,
                 "reason": (f"only {len(frames)} contiguous frames with 50 flowing "
-                           f"particles, fewer than the {window_frames}-frame window")}
+                           f"particles, fewer than the {window_frames}-frame window"),
+                "wall_assemble_s": 0.0, "wall_fit_s": 0.0}
+    t_asm = time.time()
     sysm = assemble_columns_timeweak(
         arr["x"], arr["v"], arr["mass"], arr["g"],
         arr["frame_dt"] * frame_stride, arr["n_grid"], arr["grid_lim"],
         columns_fn, n_columns=1, frames=frames, window_frames=window_frames,
         collider_planes=wall_planes(arr["n_grid"], arr["grid_lim"]),
         collider_margin_cells=margin_cells, valid_frac_min=flow_frac_min)
+    wall_assemble_s = time.time() - t_asm
     if sysm.n_rows < 8:
         return {"refused": True, "reason": "no surviving rows",
                 "n_rows": sysm.n_rows,
-                "n_rows_before_gating": sysm.n_rows_before_gating}
+                "n_rows_before_gating": sysm.n_rows_before_gating,
+                "wall_assemble_s": wall_assemble_s, "wall_fit_s": 0.0}
+    t_fit = time.time()
     out = solve_elastic_grid(sysm)
+    out["wall_assemble_s"], out["wall_fit_s"] = wall_assemble_s, time.time() - t_fit
     y = float(out["theta"][0])
     out.update({"yield_stress": y, "estimator": "momentum_yield_column",
                 "refused": False, "gd_min": gd_min,
@@ -356,6 +362,7 @@ def stage_identify_no_stress(material: str, dump: str | Path,
                              basal_dump: str | Path | None = None,
                              nclaw_bc: bool = False,
                              substeps: int | None = None,
+                             device: str = "cpu",
                              log=print) -> dict:
     """Identify from one trajectory with the stress channel excluded.
 
@@ -387,6 +394,7 @@ def stage_identify_no_stress(material: str, dump: str | Path,
     }
     variants: dict[str, dict] = {}
     walls: dict[str, float] = {}
+    scan_results: list[dict] = []   # every scan_parameter() call's own dict, for timing
 
     tier = arr["meta"].extra.get("tier", "no_stress")
     t0 = time.time()
@@ -422,8 +430,25 @@ def stage_identify_no_stress(material: str, dump: str | Path,
                 theta_base={"E": E_a, "nu": nu_a}, mode="mul",
                 refine_rounds=[[0.6, 0.8, 1.25, 1.6], [0.9, 1.1]],
                 nclaw_bc=nclaw_bc, nclaw_law=nclaw_law, substeps=substeps,
-                log=log)
+                device=device, log=log)
             walls["yield_scan_s"] = time.time() - t1
+            scan_results.append(ident["yield"])
+            yr = ident["yield_replay"]
+            if yr.get("yield_stress") is not None:
+                base, _, _ = suite.theta_for_engine(material, ident, nclaw_law=nclaw_law)
+                variants["replay"] = {
+                    "theta": {**base, "yield_stress": yr["yield_stress"]},
+                    "refused": bool(yr.get("refused", True)),
+                    "note": _REFUSED_LEG_NOTE if yr.get("refused", True) else "",
+                    "provenance": ("weak-form momentum fit on the elastic state "
+                                   "reconstructed by identify_yield_replay from "
+                                   "positions alone, elastic pair assumed; "
+                                   "reported despite refusal to measure its "
+                                   "rollout cost against the scan"),
+                    "diagnostics": {k: yr.get(k) for k in
+                                    ("yield_stress", "residual_rel", "refused",
+                                     "reason", "elastic_pair_used")},
+                }
         else:
             t1 = time.time()
             ident["friction_replay"] = identify_friction_replay(
@@ -436,8 +461,25 @@ def stage_identify_no_stress(material: str, dump: str | Path,
                 theta_base={"E": E_a, "nu": nu_a}, mode="add",
                 refine_rounds=[[-3, -2, -1, 1, 2, 3], [-0.5, 0.5]],
                 nclaw_bc=nclaw_bc, nclaw_law=nclaw_law, substeps=substeps,
-                log=log)
+                device=device, log=log)
             walls["friction_scan_s"] = time.time() - t1
+            scan_results.append(ident["friction"])
+            fr = ident["friction_replay"]
+            if fr.get("friction_angle") is not None:
+                base, _, _ = suite.theta_for_engine(material, ident, nclaw_law=nclaw_law)
+                variants["replay"] = {
+                    "theta": {**base, "friction_angle": fr["friction_angle"]},
+                    "refused": bool(fr.get("refused", True)),
+                    "note": _REFUSED_LEG_NOTE if fr.get("refused", True) else "",
+                    "provenance": ("weak-form momentum fit on the elastic state "
+                                   "reconstructed by identify_friction_replay from "
+                                   "positions alone, elastic pair assumed; "
+                                   "reported despite refusal to measure its "
+                                   "rollout cost against the scan"),
+                    "diagnostics": {k: fr.get(k) for k in
+                                    ("friction_angle", "alpha", "residual_rel",
+                                     "refused", "reason")},
+                }
     elif material in ("jelly", "plasticine"):
         ident["elastic"] = suite.identify_elastic(
             arr, window_frames=window_frames,
@@ -451,7 +493,7 @@ def stage_identify_no_stress(material: str, dump: str | Path,
                 arr, mu_hat, lam_hat, window_frames=window_frames, log=log)
             walls["yield_momentum_s"] = time.time() - t1
             ym = ident["yield_momentum"]
-            base, _ = suite.theta_for_engine(material, ident, nclaw_law=nclaw_law)
+            base, _, _ = suite.theta_for_engine(material, ident, nclaw_law=nclaw_law)
             variants["yield_momentum"] = {
                 "theta": {**base, "yield_stress": ym.get("yield_stress")},
                 "refused": bool(ym.get("refused", True)),
@@ -464,8 +506,10 @@ def stage_identify_no_stress(material: str, dump: str | Path,
                                  "row_survival", "refused", "reason")},
             }
     elif material == "sand":
+        t1 = time.time()
         fields = _sand_pressures(arr, truth, Path(basal_dump) if basal_dump else None,
                                  log=log)
+        walls["sand_pressure_reconstruct_s"] = time.time() - t1
         for key in PRESSURE_SOURCES:
             if key not in fields:
                 continue
@@ -484,7 +528,7 @@ def stage_identify_no_stress(material: str, dump: str | Path,
                 ident["friction"] = fr
             else:
                 ident[f"friction_{key}"] = fr
-                base, _ = suite.theta_for_engine(material, {}, nclaw_law=nclaw_law)
+                base, _, _ = suite.theta_for_engine(material, {}, nclaw_law=nclaw_law)
                 refused = bool(fr.get("refused", True))
                 angle = (fr.get("friction_angle_solve") if refused
                          else fr.get("friction_angle"))
@@ -515,8 +559,9 @@ def stage_identify_no_stress(material: str, dump: str | Path,
                 theta_base={"nu": nu_w}, mode="mul",
                 refine_rounds=[[0.8, 0.9, 1.1, 1.25], [0.95, 1.05]],
                 nclaw_bc=nclaw_bc, nclaw_law=nclaw_law, substeps=substeps,
-                log=log)
+                device=device, log=log)
             walls["eos_scan_s"] = time.time() - t1
+            scan_results.append(sc)
             variants["rollout_scan"] = {
                 "theta": {"E": sc["E"], "nu": nu_w},
                 "refused": False,
@@ -529,10 +574,44 @@ def stage_identify_no_stress(material: str, dump: str | Path,
             }
     walls["identify_total_s"] = time.time() - t0
 
-    theta, refused = suite.theta_for_engine(material, ident, nclaw_law=nclaw_law)
+    # Standardized breakdown across every tier: field reconstruction (MLS/FD
+    # state rebuilt from positions, or sand's pressure closures rebuilt from
+    # F), equation assembly, the linear/closed-form fit itself (including any
+    # weak-form attempt that ultimately refuses), and simulator rollouts run
+    # as part of identification (the derivative-free scans; NOT the later
+    # scoring rollouts compare.py runs separately and never counts here).
+    fit_dict_keys = ("elastic", "yield", "yield_replay", "yield_momentum",
+                     "friction", "friction_replay", "eos")
+    sub_dicts = [ident[k] for k in fit_dict_keys if isinstance(ident.get(k), dict)]
+    sub_dicts += [v for k, v in ident.items()
+                 if k.startswith("friction_") and k not in fit_dict_keys
+                 and isinstance(v, dict)]
+    reconstruct_s = (walls.get("sand_pressure_reconstruct_s", 0.0)
+                     + sum(d.get("wall_reconstruct_s", 0.0) for d in sub_dicts))
+    simulate_s = sum(v for k, v in walls.items() if k.endswith("_scan_s"))
+    # every candidate rollout the scan(s) actually simulated (not the ones
+    # reused from out/nclaw_suite/scan/*.npz), split into setup/step/
+    # snapshot/finalize; scan_parameter runs these on run_scene's default
+    # device ("cpu"), not whatever --device the rest of this comparison uses.
+    simulate_search_detail_s = {
+        k: sum(r.get("wall_simulate_detail_s", {}).get(k, 0.0) for r in scan_results)
+        for k in ("setup_s", "step_s", "snapshot_s", "finalize_s")}
+    ident["timing_breakdown_s"] = {
+        "reconstruct_fields_s": reconstruct_s,
+        "assemble_equations_s": sum(d.get("wall_assemble_s", 0.0) for d in sub_dicts),
+        "fit_parameters_s": sum(d.get("wall_fit_s", 0.0) for d in sub_dicts),
+        "simulate_s": simulate_s,
+        "simulate_search_detail_s": simulate_search_detail_s,
+        "simulate_search_device": device if scan_results else None,
+        "identify_total_s": walls["identify_total_s"],
+    }
+
+    theta, refused, param_estimator = suite.theta_for_engine(
+        material, ident, nclaw_law=nclaw_law)
     ident.update({
         "theta_engine": theta,
         "refused_parameters": refused,
+        "parameter_estimator": param_estimator,
         "theta_variants": variants,
         "wall_times_s": walls,
         "truth": truth,

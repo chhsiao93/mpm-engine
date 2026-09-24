@@ -25,13 +25,17 @@ def scan_parameter(material: str, identify_dump: str | Path, param: str,
                    coarse: list[float], theta_base: dict,
                    refine_rounds: list[list[float]], mode: str = "add",
                    nclaw_bc: bool = True, nclaw_law: bool = False,
-                   substeps: int | None = None, log=print) -> dict:
+                   substeps: int | None = None, device: str = "cpu",
+                   log=print) -> dict:
     """Best value of one parameter by position MSE against the identify dump.
 
     ``coarse`` is the blind first grid; each entry of ``refine_rounds`` is a
     list of offsets (mode "add") or factors (mode "mul") applied to the best
     value so far. A rerun re-scores cached rollouts under out/nclaw_suite/scan
-    /scan; it does not re-simulate them.
+    /scan; it does not re-simulate them -- the cache key is the candidate
+    value and compatibility flags, not ``device``, so a value already
+    simulated on one device is reused as-is if the same value is scanned
+    again on another.
     """
     from experiments.nclaw.suite import OUT, cloud_from_dump, nclaw_position_mse, run_scene
 
@@ -42,6 +46,7 @@ def scan_parameter(material: str, identify_dump: str | Path, param: str,
     cfg = (("_nclawbc" if nclaw_bc else "") + ("_nclawlaw" if nclaw_law else "")
            + (f"_sub{substeps}" if substeps is not None else ""))
     tried: dict[float, float] = {}
+    sim_timings: list[dict] = []
 
     def score(value: float) -> float:
         value = float(value)
@@ -49,10 +54,13 @@ def scan_parameter(material: str, identify_dump: str | Path, param: str,
             return tried[value]
         pred = scan_dir / f"scan_{material}_{param}_{value:g}{cfg}.npz"
         if not pred.exists():
+            t = {}
             run_scene(material, "dataset", pred,
                       theta={**theta_base, param: value}, cloud=cloud,
                       nclaw_bc=nclaw_bc, nclaw_law=nclaw_law,
-                      substeps=substeps, log=lambda *a: None)
+                      substeps=substeps, device=device,
+                      log=lambda *a: None, timing=t)
+            sim_timings.append(t)
         sc = nclaw_position_mse(identify_dump, pred, strict=False)
         import numpy as np
         n_expected = int(np.load(identify_dump)["x"].shape[0])
@@ -68,6 +76,8 @@ def scan_parameter(material: str, identify_dump: str | Path, param: str,
         for o in offsets:
             score(best + o if mode == "add" else best * o)
         best = min(tried, key=tried.get)
+    detail_s = {k: sum(t.get(k, 0.0) for t in sim_timings)
+               for k in ("setup_s", "step_s", "snapshot_s", "finalize_s")}
     return {
         param: float(best),
         "estimator": "rollout_scan",
@@ -75,8 +85,12 @@ def scan_parameter(material: str, identify_dump: str | Path, param: str,
         "mse_at_best": tried[best],
         "scan": {f"{v:g}": tried[v] for v in sorted(tried)},
         "n_rollouts": len(tried),
+        "n_simulated": len(sim_timings),   # vs n_rollouts: the rest were cached npz
         "assumed": dict(theta_base),
         "mode": mode,
+        "device": device,
+        "wall_simulate_s": sum(detail_s.values()),
+        "wall_simulate_detail_s": detail_s,
         "objective": ("position MSE of an engine rollout against the identify "
                       "trajectory, seeded from the tier's own frame-0 state"),
     }
