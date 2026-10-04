@@ -3,7 +3,7 @@ name = "warpmpm"
 version = "0.0.1"
 license = {text = "MIT"}
 description = "Fast, modular Warp-MPM engine for robot manipulation of deformable + granular media (dough first, terrain/rovers next). Sparse-grid + implicit, MuJoCo coupling, Isaac-ready."
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     # kernels use the API subset common to warp 1.10.1 through 1.14+: public warp.float32/
     # int32/array (the warp.types.* aliases were removed in 1.14) and wp.matrix_from_cols
